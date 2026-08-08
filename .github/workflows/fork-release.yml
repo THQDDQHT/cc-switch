@@ -317,8 +317,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
+          # draft release 尚未成为 releases/latest，按 tag 查询会 404；
+          # 改用 release id 查询资产（与上游幂等思路一致）。
+          RELEASE_ID=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json id --jq '.id')
           EXPECTED_ASSETS=$(printf '%s\n' release-assets/* | while IFS= read -r path; do basename "$path"; done | sort)
-          ACTUAL_ASSETS=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          ACTUAL_ASSETS=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --jq '.assets[].name' | sort)
           if [ "$EXPECTED_ASSETS" != "$ACTUAL_ASSETS" ]; then
             echo "Release asset verification failed." >&2
