@@ -283,34 +283,28 @@ jobs:
           - `.app.tar.gz` 与 `.sig` 仅供应用内 updater 使用；手动安装请下载 `.zip`。
           EOF
 
-          RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>/dev/null || true)
-          IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | node -e '
-            let input = "";
-            process.stdin.on("data", (chunk) => (input += chunk));
-            process.stdin.on("end", () => {
-              if (!input.trim()) { process.stdout.write("missing"); return; }
-              try {
-                process.stdout.write(String(JSON.parse(input).draft));
-              } catch {
-                process.stdout.write("unparseable");
-              }
-            });
-          ')
-          if [ "$IS_DRAFT" = "true" ]; then
-            gh release edit "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "CC Switch $GITHUB_REF_NAME" \
-              --notes-file release-notes.md
-          elif [ "$IS_DRAFT" = "missing" ] || [ "$IS_DRAFT" = "unparseable" ]; then
+          # gh release view 对不存在的 release 干净地返回非零退出码
+          # （gh api 会返回非空 404 JSON，无法用非空判断）。用退出码判定，
+          # 与上游 release.yml 的幂等思路一致。
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq '.isDraft')
+            if [ "$IS_DRAFT" = "true" ]; then
+              gh release edit "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "CC Switch $GITHUB_REF_NAME" \
+                --notes-file release-notes.md
+            else
+              echo "Release already exists and is published; refusing to replace it." >&2
+              exit 1
+            fi
+          else
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
               --title "CC Switch $GITHUB_REF_NAME" \
               --notes-file release-notes.md
-          else
-            echo "Release already exists and is published; refusing to replace it." >&2
-            exit 1
           fi
 
       - name: Upload and verify Release assets
