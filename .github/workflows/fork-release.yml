@@ -293,7 +293,7 @@ jobs:
           body_path: release-notes.md
           files: release-assets/*
           fail_on_unmatched_files: true
-          overwrite: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
