@@ -265,10 +265,8 @@ jobs:
           }
           NODE
 
-      - name: Create or update draft Release
+      - name: Generate release notes
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # 标题需要展开变量；正文含 Markdown 反引号，必须用带引号定界符的 heredoc
@@ -283,60 +281,35 @@ jobs:
           - `.app.tar.gz` 与 `.sig` 仅供应用内 updater 使用；手动安装请下载 `.zip`。
           EOF
 
-          # gh release view 对不存在的 release 干净地返回非零退出码
-          # （gh api 会返回非空 404 JSON，无法用非空判断）。用退出码判定，
-          # 与上游 release.yml 的幂等思路一致。
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            IS_DRAFT=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft --jq '.isDraft')
-            if [ "$IS_DRAFT" = "true" ]; then
-              gh release edit "$GITHUB_REF_NAME" \
-                --repo "$GITHUB_REPOSITORY" \
-                --title "CC Switch $GITHUB_REF_NAME" \
-                --notes-file release-notes.md
-            else
-              echo "Release already exists and is published; refusing to replace it." >&2
-              exit 1
-            fi
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --draft \
-              --title "CC Switch $GITHUB_REF_NAME" \
-              --notes-file release-notes.md
-          fi
+      # 与上游 release.yml 一致：softprops/action-gh-release 幂等处理
+      # 「不存在就创建、存在就更新」，无需自写存在性判断。
+      - name: Create draft Release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CC Switch ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+          body_path: release-notes.md
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          overwrite: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload and verify Release assets
+      - name: Verify Release assets
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "$GITHUB_REF_NAME" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
-          # draft release 尚未成为 releases/latest，按 tag 查询会 404；
-          # 从列表端点过滤出数字 release id（gh release view --json id 返回
-          # GraphQL node id，不能用于 REST 资产查询）。
-          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
-            --jq ".[] | select(.tag_name==\"$GITHUB_REF_NAME\") | .id" | head -1)
-          EXPECTED_ASSETS=$(printf '%s\n' release-assets/* | while IFS= read -r path; do basename "$path"; done | sort)
-          ACTUAL_ASSETS=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            --jq '.assets[].name' | sort)
-          if [ "$EXPECTED_ASSETS" != "$ACTUAL_ASSETS" ]; then
-            echo "Release asset verification failed." >&2
-            diff -u <(printf '%s\n' "$EXPECTED_ASSETS") <(printf '%s\n' "$ACTUAL_ASSETS") || true
-            exit 1
-          fi
-
           VERIFY_DIR=$(mktemp -d)
           gh release download "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json \
             --dir "$VERIFY_DIR"
           cmp release-assets/latest.json "$VERIFY_DIR/latest.json"
+          rm -rf "$VERIFY_DIR"
 
       - name: Publish stable latest Release
         shell: bash
