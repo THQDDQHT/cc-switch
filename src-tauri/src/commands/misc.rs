@@ -1173,8 +1173,22 @@ fn build_exec_line(shell: &str, cwd: Option<&Path>) -> String {
 
 /// 构建 provider 命令行：通过用户 shell 的交互模式执行，确保 GUI 启动的终端也加载用户 PATH。
 #[cfg_attr(windows, allow(dead_code))]
-fn build_provider_command_line(shell: &str, config_path: &str, cwd: Option<&Path>) -> String {
-    let claude_command = format!("claude --settings {}", shell_single_quote(config_path));
+fn build_provider_command_line(
+    shell: &str,
+    config_path: &str,
+    cwd: Option<&Path>,
+    isolate_settings_sources: bool,
+) -> String {
+    let setting_sources = if isolate_settings_sources {
+        format!(" --setting-sources {}", shell_single_quote(""))
+    } else {
+        String::new()
+    };
+    let claude_command = format!(
+        "claude --settings {}{}",
+        shell_single_quote(config_path),
+        setting_sources
+    );
     let command = cwd
         .map(|dir| {
             format!(
@@ -3347,12 +3361,29 @@ pub async fn open_provider_terminal(
         .get(&providerId)
         .ok_or_else(|| format!("提供商 {providerId} 不存在"))?;
 
-    // 从提供商配置中提取环境变量
-    let config = &provider.settings_config;
-    let env_vars = extract_env_vars_from_config(config, &app_type);
+    // Claude 使用完整配置（合并通用配置片段 + 清理内部字段），确保
+    // model、permissions 等 settings.json 字段一并生效；其余应用保持
+    // 原有的 env 提取逻辑。
+    let is_claude = matches!(app_type, AppType::Claude);
+    let settings = if is_claude {
+        let effective = crate::services::provider::build_effective_settings_with_common_config(
+            state.db.as_ref(),
+            &app_type,
+            provider,
+        )
+        .map_err(|e| format!("生成供应商完整配置失败: {e}"))?;
+        crate::services::provider::sanitize_claude_settings_for_live(&effective)
+    } else {
+        let mut env_map = serde_json::Map::new();
+        for (key, value) in extract_env_vars_from_config(&provider.settings_config, &app_type) {
+            env_map.insert(key, serde_json::Value::String(value));
+        }
+        // 与原有行为一致：非 Claude 应用同样以 {"env": {...}} 结构经 --settings 注入
+        serde_json::json!({ "env": env_map })
+    };
 
     // 根据平台启动终端，传入提供商ID用于生成唯一的配置文件名
-    launch_terminal_with_env(env_vars, &providerId, launch_cwd.as_deref())
+    launch_terminal_with_settings(&settings, &providerId, launch_cwd.as_deref(), is_claude)
         .map_err(|e| format!("启动终端失败: {e}"))?;
 
     Ok(true)
@@ -3374,19 +3405,6 @@ fn extract_env_vars_from_config(
         for (key, value) in env {
             if let Some(str_val) = value.as_str() {
                 env_vars.push((key.clone(), str_val.to_string()));
-            }
-        }
-
-        // 处理 base_url: 根据应用类型添加对应的环境变量
-        let base_url_key = match app_type {
-            AppType::Claude | AppType::ClaudeDesktop => Some("ANTHROPIC_BASE_URL"),
-            AppType::Gemini => Some("GOOGLE_GEMINI_BASE_URL"),
-            _ => None,
-        };
-
-        if let Some(key) = base_url_key {
-            if let Some(url_str) = env.get(key).and_then(|v| v.as_str()) {
-                env_vars.push((key.to_string(), url_str.to_string()));
             }
         }
     }
@@ -3447,12 +3465,16 @@ fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
 
 /// 创建临时配置文件并启动 claude 终端
 /// 使用 --settings 参数传入提供商特定的 API 配置
-fn launch_terminal_with_env(
-    env_vars: Vec<(String, String)>,
+fn launch_terminal_with_settings(
+    settings: &serde_json::Value,
     provider_id: &str,
     cwd: Option<&Path>,
+    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     let temp_dir = std::env::temp_dir();
+    // 写新文件前清理历史残留，避免 temp 目录垃圾累积
+    cleanup_stale_terminal_temp_files(&temp_dir);
+
     let config_file = temp_dir.join(format!(
         "claude_{}_{}.json",
         provider_id,
@@ -3460,23 +3482,23 @@ fn launch_terminal_with_env(
     ));
 
     // 创建并写入配置文件
-    write_claude_config(&config_file, &env_vars)?;
+    write_claude_config(&config_file, settings)?;
 
     #[cfg(target_os = "macos")]
     {
-        launch_macos_terminal(&config_file, cwd)?;
+        launch_macos_terminal(&config_file, cwd, isolate_settings_sources)?;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
-        launch_linux_terminal(&config_file, cwd)?;
+        launch_linux_terminal(&config_file, cwd, isolate_settings_sources)?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        launch_windows_terminal(&temp_dir, &config_file, cwd)?;
+        launch_windows_terminal(&temp_dir, &config_file, cwd, isolate_settings_sources)?;
         Ok(())
     }
 
@@ -3484,29 +3506,90 @@ fn launch_terminal_with_env(
     Err("不支持的操作系统".to_string())
 }
 
-/// 写入 claude 配置文件
+/// 写入 claude 配置文件（完整 settings 结构）
 fn write_claude_config(
     config_file: &std::path::Path,
-    env_vars: &[(String, String)],
+    settings: &serde_json::Value,
 ) -> Result<(), String> {
-    let mut config_obj = serde_json::Map::new();
-    let mut env_obj = serde_json::Map::new();
-
-    for (key, value) in env_vars {
-        env_obj.insert(key.clone(), serde_json::Value::String(value.clone()));
-    }
-
-    config_obj.insert("env".to_string(), serde_json::Value::Object(env_obj));
-
     let config_json =
-        serde_json::to_string_pretty(&config_obj).map_err(|e| format!("序列化配置失败: {e}"))?;
+        serde_json::to_string_pretty(settings).map_err(|e| format!("序列化配置失败: {e}"))?;
 
     std::fs::write(config_file, config_json).map_err(|e| format!("写入配置文件失败: {e}"))
 }
 
+/// 清理历史临时终端配置文件（claude_*.json 配置 + cc_switch_launcher_*.sh 脚本）。
+/// 策略：删除修改时间超过 24h 的；剩余超过 20 个时删最旧的。
+/// 删除失败只 warn，不阻断终端启动（与 cleanup_old_backups 等现有清理模式一致）。
+fn cleanup_stale_terminal_temp_files(temp_dir: &Path) {
+    const MAX_AGE_SECS: u64 = 24 * 60 * 60;
+    const MAX_FILES: usize = 20;
+
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return;
+    };
+
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            (name.starts_with("claude_") && name.ends_with(".json"))
+                || name.starts_with("cc_switch_launcher_")
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now();
+    let mut expired = Vec::new();
+    let mut retained = Vec::new();
+
+    for path in candidates.drain(..) {
+        let is_expired = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() > MAX_AGE_SECS);
+
+        if is_expired {
+            expired.push(path);
+        } else {
+            retained.push(path);
+        }
+    }
+
+    // 剩余超过上限时按修改时间排序，删最旧
+    if retained.len() > MAX_FILES {
+        retained.sort_by(|a, b| {
+            let a_time = a.metadata().and_then(|m| m.modified()).ok();
+            let b_time = b.metadata().and_then(|m| m.modified()).ok();
+            a_time.cmp(&b_time)
+        });
+        let excess = retained.len() - MAX_FILES;
+        expired.extend(retained.drain(..excess));
+    }
+
+    for path in expired {
+        if let Err(err) = std::fs::remove_file(&path) {
+            log::warn!(
+                "Failed to remove stale terminal temp file {}: {}",
+                path.display(),
+                err
+            );
+        }
+    }
+}
+
 /// macOS: 根据用户首选终端启动
 #[cfg(target_os = "macos")]
-fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> Result<(), String> {
+fn launch_macos_terminal(
+    config_file: &std::path::Path,
+    cwd: Option<&Path>,
+    isolate_settings_sources: bool,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let preferred = crate::settings::get_preferred_terminal();
@@ -3519,16 +3602,20 @@ fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     let temp_dir = std::env::temp_dir();
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
-    let provider_command = build_provider_command_line(&shell, &config_path, cwd);
+    let provider_command =
+        build_provider_command_line(&shell, &config_path, cwd, isolate_settings_sources);
 
     // Write the shell script to a temp file
     // 脚本使用 POSIX sh 语法确保可移植性，exec 行切换到用户交互式 shell
+    // 配置文件删除放在 claude 前台运行之后（对齐 Windows 的 del 模式），
+    // 避免 trap 在 claude 异步退出时删除时机与读取产生竞态。
     let script_content = format!(
         r#"#!/usr/bin/env sh
-trap 'rm -f "{config_path}" "{script_file}"' EXIT
+trap 'rm -f "{script_file}"' EXIT
 echo "Using provider-specific claude config:"
 echo "{config_path}"
 {provider_command}
+rm -f "{config_path}"
 {final_cd_command}
 {exec_line}
 "#,
@@ -3552,9 +3639,9 @@ echo "{config_path}"
         "warp" => launch_macos_warp(&script_file),
         "alacritty" => launch_macos_open_app("Alacritty", &script_file, true),
         "kitty" => launch_macos_open_app("kitty", &script_file, false),
-        "ghostty" => launch_macos_ghostty(&script_file),
-        "wezterm" => launch_macos_open_app("WezTerm", &script_file, true),
-        "kaku" => launch_macos_open_app("Kaku", &script_file, true),
+        "ghostty" => launch_macos_ghostty_provider_tab(&script_file),
+        "wezterm" => launch_macos_wezterm_compatible_tab("WezTerm", "wezterm", &script_file, cwd),
+        "kaku" => launch_macos_wezterm_compatible_tab("Kaku", "kaku", &script_file, cwd),
         _ => launch_macos_terminal_app(&script_file),
     };
 
@@ -3722,6 +3809,44 @@ end if
     )
 }
 
+/// macOS: provider terminal 在已有 Ghostty 窗口中新建 tab；无窗口或冷启动时创建首窗。
+/// 冷启动禁用窗口状态恢复，避免旧 tab 被还原并抢占 provider tab 的焦点。
+#[cfg(target_os = "macos")]
+fn build_macos_ghostty_provider_tab_applescript(script_file: &std::path::Path) -> String {
+    format!(
+        r#"set launcher_command to {launcher}
+set was_running to application "Ghostty" is running
+if was_running then
+    tell application "Ghostty"
+        if (count of windows) = 0 then
+            new window with configuration {{command:launcher_command}}
+        else
+            new tab in front window with configuration {{command:launcher_command}}
+        end if
+    end tell
+else
+    do shell script "open -na Ghostty --args --quit-after-last-window-closed=true --window-save-state=never " & quoted form of ("--initial-command=" & launcher_command)
+end if
+"#,
+        launcher = applescript_launcher_command(script_file)
+    )
+}
+
+/// macOS: provider terminal 优先复用 Ghostty 前台窗口；AppleScript 失败时保留旧路径。
+#[cfg(target_os = "macos")]
+fn launch_macos_ghostty_provider_tab(script_file: &std::path::Path) -> Result<(), String> {
+    match run_terminal_osascript(
+        &build_macos_ghostty_provider_tab_applescript(script_file),
+        "Ghostty tab",
+    ) {
+        Ok(()) => Ok(()),
+        Err(tab_error) => {
+            log::warn!("Ghostty tab launch failed, falling back to existing behavior: {tab_error}");
+            launch_macos_ghostty(script_file)
+        }
+    }
+}
+
 /// macOS: Ghostty
 #[cfg(target_os = "macos")]
 fn launch_macos_ghostty(script_file: &std::path::Path) -> Result<(), String> {
@@ -3771,6 +3896,80 @@ fn launch_macos_open_app(
     }
 
     Ok(())
+}
+
+/// Build WezTerm-compatible `start --new-tab` argv without shell interpolation.
+#[cfg(target_os = "macos")]
+fn build_macos_wezterm_compatible_tab_args(
+    script_file: &std::path::Path,
+    cwd: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["start".into(), "--new-tab".into()];
+    if let Some(cwd) = cwd {
+        args.push("--cwd".into());
+        args.push(cwd.as_os_str().to_owned());
+    }
+    args.push("--".into());
+    args.push("/bin/sh".into());
+    args.push(script_file.as_os_str().to_owned());
+    args
+}
+
+/// Prefer the app bundle CLI because GUI-launched CC Switch may not inherit the user's PATH.
+#[cfg(target_os = "macos")]
+fn resolve_macos_app_cli(app_name: &str, executable_name: &str) -> std::path::PathBuf {
+    let system_path = std::path::PathBuf::from(format!(
+        "/Applications/{app_name}.app/Contents/MacOS/{executable_name}"
+    ));
+    if system_path.is_file() {
+        return system_path;
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_path = std::path::PathBuf::from(home)
+            .join("Applications")
+            .join(format!("{app_name}.app"))
+            .join("Contents")
+            .join("MacOS")
+            .join(executable_name);
+        if user_path.is_file() {
+            return user_path;
+        }
+    }
+
+    std::path::PathBuf::from(executable_name)
+}
+
+/// macOS: WezTerm/Kaku 已运行时使用现有窗口的新 tab；CLI 不可用时回退旧窗口路径。
+#[cfg(target_os = "macos")]
+fn launch_macos_wezterm_compatible_tab(
+    app_name: &str,
+    executable_name: &str,
+    script_file: &std::path::Path,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
+    use std::process::Command;
+
+    let executable = resolve_macos_app_cli(app_name, executable_name);
+    let args = build_macos_wezterm_compatible_tab_args(script_file, cwd);
+    let tab_result = Command::new(&executable).args(&args).output();
+
+    let tab_error = match tab_result {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = decode_command_output(&output.stderr);
+            format!(
+                "{} tab launch failed (exit code: {:?}): {}",
+                app_name,
+                output.status.code(),
+                stderr
+            )
+        }
+        Err(err) => format!("failed to execute {}: {}", executable.display(), err),
+    };
+
+    log::warn!("{app_name} new-tab launch failed, falling back to existing behavior: {tab_error}");
+    launch_macos_open_app(app_name, script_file, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -3826,7 +4025,11 @@ fn launch_macos_warp(script_file: &std::path::Path) -> Result<(), String> {
 
 /// Linux: 根据用户首选终端启动
 #[cfg(target_os = "linux")]
-fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> Result<(), String> {
+fn launch_linux_terminal(
+    config_file: &std::path::Path,
+    cwd: Option<&Path>,
+    isolate_settings_sources: bool,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -3852,14 +4055,16 @@ fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     let temp_dir = std::env::temp_dir();
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
-    let provider_command = build_provider_command_line(&shell, &config_path, cwd);
+    let provider_command =
+        build_provider_command_line(&shell, &config_path, cwd, isolate_settings_sources);
 
     let script_content = format!(
         r#"#!/usr/bin/env sh
-trap 'rm -f "{config_path}" "{script_file}"' EXIT
+trap 'rm -f "{script_file}"' EXIT
 echo "Using provider-specific claude config:"
 echo "{config_path}"
 {provider_command}
+rm -f "{config_path}"
 {final_cd_command}
 {exec_line}
 "#,
@@ -3947,6 +4152,7 @@ fn launch_windows_terminal(
     temp_dir: &std::path::Path,
     config_file: &std::path::Path,
     cwd: Option<&Path>,
+    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
@@ -3954,19 +4160,20 @@ fn launch_windows_terminal(
     let bat_file = temp_dir.join(format!("cc_switch_claude_{}.bat", std::process::id()));
     let config_path_for_batch = escape_windows_batch_value(&config_file.to_string_lossy());
     let cwd_command = build_windows_cwd_command(cwd);
+    let provider_command =
+        build_windows_provider_command_line(&config_path_for_batch, isolate_settings_sources);
 
     let content = format!(
         "@echo off
 {cwd_command}
 echo Using provider-specific claude config:
-echo {}
-claude --settings \"{}\"
-del \"{}\" >nul 2>&1
+echo {config_path}
+{provider_command}
+del \"{config_path}\" >nul 2>&1
 del \"%~f0\" >nul 2>&1
 ",
-        config_path_for_batch,
-        config_path_for_batch,
-        config_path_for_batch,
+        config_path = config_path_for_batch,
+        provider_command = provider_command,
         cwd_command = cwd_command,
     );
 
@@ -4001,6 +4208,20 @@ del \"%~f0\" >nul 2>&1
 #[cfg_attr(windows, allow(dead_code))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_windows_provider_command_line(
+    config_path_for_batch: &str,
+    isolate_settings_sources: bool,
+) -> String {
+    let setting_sources = if isolate_settings_sources {
+        " --setting-sources \"\""
+    } else {
+        ""
+    };
+
+    format!("claude --settings \"{config_path_for_batch}\"{setting_sources}")
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -4338,14 +4559,15 @@ mod tests {
     #[test]
     fn test_build_provider_command_line_uses_user_shell_environment() {
         assert_eq!(
-            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None),
+            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None, false),
             "'/bin/zsh' -lic 'claude --settings '\"'\"'/tmp/claude config.json'\"'\"''"
         );
         assert_eq!(
             build_provider_command_line(
                 "/bin/bash",
                 "/tmp/claude config.json",
-                Some(Path::new("/tmp/project"))
+                Some(Path::new("/tmp/project")),
+                false,
             ),
             r#"'/bin/bash' -ic 'cd '"'"'/tmp/project'"'"' && claude --settings '"'"'/tmp/claude config.json'"'"''"#
         );
@@ -4353,9 +4575,18 @@ mod tests {
             build_provider_command_line(
                 "/bin/sh",
                 "/tmp/claude config.json",
-                Some(Path::new("/tmp/project O'Brien"))
+                Some(Path::new("/tmp/project O'Brien")),
+                false,
             ),
             r#"'/bin/sh' -c 'cd '"'"'/tmp/project O'"'"'"'"'"'"'"'"'Brien'"'"' && claude --settings '"'"'/tmp/claude config.json'"'"''"#
+        );
+    }
+
+    #[test]
+    fn test_build_provider_command_line_isolates_claude_settings_sources() {
+        assert_eq!(
+            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None, true,),
+            r#"'/bin/zsh' -lic 'claude --settings '"'"'/tmp/claude config.json'"'"' --setting-sources '"'"''"'"''"#
         );
     }
 
@@ -6328,6 +6559,67 @@ mod tests {
         );
     }
 
+    /// Provider terminal uses a tab in an existing Ghostty window without changing cold starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ghostty_provider_applescript_prefers_tab_and_preserves_first_window_paths() {
+        let script =
+            build_macos_ghostty_provider_tab_applescript(Path::new("/tmp/cc_switch_launcher.sh"));
+
+        assert!(script.contains("if (count of windows) = 0 then"));
+        assert!(script.contains("new window with configuration {command:launcher_command}"));
+        assert!(script
+            .contains("new tab in front window with configuration {command:launcher_command}"));
+        assert!(
+            script.contains(
+                r#"do shell script "open -na Ghostty --args --quit-after-last-window-closed=true --window-save-state=never " & quoted form of ("--initial-command=" & launcher_command)"#
+            ),
+            "cold start should launch one provider tab without restoring unrelated tabs:\n{script}"
+        );
+        assert!(!script.contains("System Events"));
+        assert!(!script.contains("delay "));
+        assert!(!script.contains("close window"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wezterm_compatible_tab_args_keep_paths_as_separate_argv() {
+        let script = Path::new("/Users/me/it's $project/launcher.sh");
+        let cwd = Path::new("/Users/me/it's $project");
+        let args = build_macos_wezterm_compatible_tab_args(script, Some(cwd));
+
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("start"),
+                std::ffi::OsString::from("--new-tab"),
+                std::ffi::OsString::from("--cwd"),
+                cwd.as_os_str().to_owned(),
+                std::ffi::OsString::from("--"),
+                std::ffi::OsString::from("/bin/sh"),
+                script.as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wezterm_compatible_tab_args_omit_missing_cwd() {
+        let script = Path::new("/tmp/cc_switch_launcher.sh");
+        let args = build_macos_wezterm_compatible_tab_args(script, None);
+
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("start"),
+                std::ffi::OsString::from("--new-tab"),
+                std::ffi::OsString::from("--"),
+                std::ffi::OsString::from("/bin/sh"),
+                script.as_os_str().to_owned(),
+            ]
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn dash_c_command_wraps_script_path_inside_quoted_arg() {
@@ -6369,6 +6661,22 @@ mod tests {
     }
 
     #[test]
+    fn build_windows_provider_command_line_preserves_existing_behavior() {
+        assert_eq!(
+            build_windows_provider_command_line(r"C:\temp dir\claude.json", false),
+            r#"claude --settings "C:\temp dir\claude.json""#
+        );
+    }
+
+    #[test]
+    fn build_windows_provider_command_line_isolates_claude_settings_sources() {
+        assert_eq!(
+            build_windows_provider_command_line(r"C:\temp dir\claude.json", true),
+            r#"claude --settings "C:\temp dir\claude.json" --setting-sources """#
+        );
+    }
+
+    #[test]
     fn build_windows_cwd_command_str_uses_cd_for_drive_paths() {
         let command = build_windows_cwd_command_str(r"C:\work\repo");
 
@@ -6393,5 +6701,87 @@ mod tests {
             command,
             "pushd \"\\\\server\\share\\100%%^&^(test^)\" || exit /b 1\r\n"
         );
+    }
+
+    // 模拟文件 mtime:写入后把 mtime 改到 ages_hours 小时前
+    #[cfg(unix)]
+    fn age_file(path: &Path, ages_hours: u64) {
+        let secs = ages_hours * 3600;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let target = now.saturating_sub(secs);
+        let file = std::fs::File::open(path).unwrap();
+        let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(target);
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_terminal_temp_files_removes_expired_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("claude_p1_123.json");
+        let stale = dir.path().join("claude_p2_456.json");
+        let launcher = dir.path().join("cc_switch_launcher_789.sh");
+        let unrelated = dir.path().join("other.json");
+
+        std::fs::write(&fresh, b"{}").unwrap();
+        std::fs::write(&stale, b"{}").unwrap();
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&unrelated, b"{}").unwrap();
+
+        age_file(&stale, 25); // >24h
+        age_file(&launcher, 25);
+        age_file(&unrelated, 25); // 不应被删(非目标前缀)
+
+        cleanup_stale_terminal_temp_files(dir.path());
+
+        assert!(fresh.exists(), "fresh config should be kept");
+        assert!(!stale.exists(), "stale config (>24h) should be removed");
+        assert!(
+            !launcher.exists(),
+            "stale launcher script should be removed"
+        );
+        assert!(
+            unrelated.exists(),
+            "non-target file should never be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_terminal_temp_files_caps_total_count() {
+        let dir = tempfile::tempdir().unwrap();
+        // 21 个新文件(均 <24h),应只保留 20 个,删最旧的 1 个
+        let mut paths = Vec::new();
+        for i in 0..21 {
+            let p = dir.path().join(format!("claude_p{i}_{i}.json"));
+            std::fs::write(&p, b"{}").unwrap();
+            paths.push(p);
+        }
+
+        // 让第一个最旧
+        age_file(&paths[0], 1);
+
+        cleanup_stale_terminal_temp_files(dir.path());
+
+        let remaining = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(remaining, 20, "count should be capped at MAX_FILES");
+        assert!(
+            !paths[0].exists(),
+            "oldest file should be removed when over the cap"
+        );
+        assert!(paths[1].exists(), "newer files should be kept");
+    }
+
+    #[test]
+    fn cleanup_stale_terminal_temp_files_empty_dir_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        cleanup_stale_terminal_temp_files(dir.path()); // 不应 panic
     }
 }
