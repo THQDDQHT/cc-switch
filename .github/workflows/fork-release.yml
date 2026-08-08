@@ -42,8 +42,13 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # dtolnay/rust-toolchain 的 targets 参数在 macOS arm64 runner 上只装了
+      # host target（aarch64-apple-darwin），x86_64-apple-darwin 被跳过；
+      # 与上游 release.yml 保持一致，显式安装两个目标。
+      - name: Add macOS targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Setup pnpm
         env:
