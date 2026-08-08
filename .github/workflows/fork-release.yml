@@ -318,9 +318,10 @@ jobs:
             --clobber
 
           # draft release 尚未成为 releases/latest，按 tag 查询会 404；
-          # 改用 release id 查询资产（与上游幂等思路一致）。
-          RELEASE_ID=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --json id --jq '.id')
+          # 从列表端点过滤出数字 release id（gh release view --json id 返回
+          # GraphQL node id，不能用于 REST 资产查询）。
+          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+            --jq ".[] | select(.tag_name==\"$GITHUB_REF_NAME\") | .id" | head -1)
           EXPECTED_ASSETS=$(printf '%s\n' release-assets/* | while IFS= read -r path; do basename "$path"; done | sort)
           ACTUAL_ASSETS=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --jq '.assets[].name' | sort)
