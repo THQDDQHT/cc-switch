@@ -284,27 +284,33 @@ jobs:
           EOF
 
           RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>/dev/null || true)
-          if [ -n "$RELEASE_JSON" ]; then
-            IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | node -e '
-              let input = "";
-              process.stdin.on("data", (chunk) => (input += chunk));
-              process.stdin.on("end", () => process.stdout.write(String(JSON.parse(input).draft)));
-            ')
-            if [ "$IS_DRAFT" != "true" ]; then
-              echo "Release already exists and is published; refusing to replace it." >&2
-              exit 1
-            fi
+          IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => (input += chunk));
+            process.stdin.on("end", () => {
+              if (!input.trim()) { process.stdout.write("missing"); return; }
+              try {
+                process.stdout.write(String(JSON.parse(input).draft));
+              } catch {
+                process.stdout.write("unparseable");
+              }
+            });
+          ')
+          if [ "$IS_DRAFT" = "true" ]; then
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --title "CC Switch $GITHUB_REF_NAME" \
               --notes-file release-notes.md
-          else
+          elif [ "$IS_DRAFT" = "missing" ] || [ "$IS_DRAFT" = "unparseable" ]; then
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
               --title "CC Switch $GITHUB_REF_NAME" \
               --notes-file release-notes.md
+          else
+            echo "Release already exists and is published; refusing to replace it." >&2
+            exit 1
           fi
 
       - name: Upload and verify Release assets
