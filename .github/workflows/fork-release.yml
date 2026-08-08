@@ -1,0 +1,347 @@
+name: Fork macOS Release
+
+on:
+  push:
+    tags:
+      - "fork-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FORK_CONFIG: src-tauri/tauri.fork.conf.json
+  FORK_REPOSITORY_URL: https://github.com/THQDDQHT/cc-switch
+  FORK_RELEASES_URL: https://github.com/THQDDQHT/cc-switch/releases/latest
+  FORK_UPDATER_URL: https://github.com/THQDDQHT/cc-switch/releases/latest/download/latest.json
+  FORK_TAG_PREFIX: fork-v
+  # Rust 1.95 on macOS 27: release strip=symbols corrupts proc-macro dylibs
+  # (rust-lang/rust#157750, "can't find crate" errors), and thin LTO fails on
+  # the inherited phf_macros 0.10. Both overrides keep the build green.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_STRIP: "none"
+
+jobs:
+  release:
+    name: Build and publish macOS Universal
+    runs-on: macos-14
+    environment: fork-release
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate tag and fork config
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          if [[ ! "$TAG" =~ ^fork-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid fork release tag: $TAG" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#fork-v}"
+          CONFIG_VERSION=$(node -e '
+            const fs = require("fs");
+            const config = JSON.parse(fs.readFileSync(process.env.FORK_CONFIG, "utf8"));
+            process.stdout.write(config.version ?? "");
+          ')
+          if [ "$VERSION" != "$CONFIG_VERSION" ]; then
+            echo "Tag version ($VERSION) does not match fork config version ($CONFIG_VERSION)." >&2
+            exit 1
+          fi
+
+          CONFIG_ENDPOINT=$(node -e '
+            const fs = require("fs");
+            const config = JSON.parse(fs.readFileSync(process.env.FORK_CONFIG, "utf8"));
+            process.stdout.write(config.plugins?.updater?.endpoints?.[0] ?? "");
+          ')
+          if [ "$CONFIG_ENDPOINT" != "$FORK_UPDATER_URL" ]; then
+            echo "Fork updater endpoint does not match the workflow distribution URL." >&2
+            exit 1
+          fi
+
+          echo "FORK_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Validate updater signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is not configured in the fork-release environment." >&2
+            exit 1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not configured in the fork-release environment." >&2
+            exit 1
+          fi
+
+      - name: Build Tauri app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_CC_SWITCH_REPOSITORY_URL: ${{ env.FORK_REPOSITORY_URL }}
+          VITE_CC_SWITCH_RELEASE_TAG_PREFIX: ${{ env.FORK_TAG_PREFIX }}
+          CC_SWITCH_RELEASES_URL: ${{ env.FORK_RELEASES_URL }}
+        run: |
+          set -euo pipefail
+          pnpm tauri build \
+            --target universal-apple-darwin \
+            --bundles app \
+            --config "$FORK_CONFIG" \
+            --ci
+
+      - name: Verify and prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          BUNDLE_DIR="src-tauri/target/universal-apple-darwin/release/bundle/macos"
+          APPS=("$BUNDLE_DIR"/*.app)
+          TARBALLS=("$BUNDLE_DIR"/*.tar.gz)
+          if [ "${#APPS[@]}" -ne 1 ]; then
+            echo "Expected exactly one .app bundle, found ${#APPS[@]}." >&2
+            exit 1
+          fi
+          if [ "${#TARBALLS[@]}" -ne 1 ]; then
+            echo "Expected exactly one updater tarball, found ${#TARBALLS[@]}." >&2
+            exit 1
+          fi
+
+          APP_PATH="${APPS[0]}"
+          TAR_PATH="${TARBALLS[0]}"
+          SIG_PATH="$TAR_PATH.sig"
+          if [ ! -s "$SIG_PATH" ]; then
+            echo "Updater signature is missing or empty." >&2
+            exit 1
+          fi
+
+          INFO_PLIST="$APP_PATH/Contents/Info.plist"
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST")
+          APP_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST")
+          APP_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$INFO_PLIST")
+          if [ "$APP_VERSION" != "$FORK_VERSION" ]; then
+            echo "App version ($APP_VERSION) does not match release version ($FORK_VERSION)." >&2
+            exit 1
+          fi
+          if [ "$APP_IDENTIFIER" != "com.ccswitch.desktop" ]; then
+            echo "Unexpected bundle identifier: $APP_IDENTIFIER" >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          SIGNATURE_KIND=$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep '^Signature=' || true)
+          if [ "$SIGNATURE_KIND" != "Signature=adhoc" ]; then
+            echo "Expected an ad-hoc signed app, got: ${SIGNATURE_KIND:-unknown}" >&2
+            exit 1
+          fi
+
+          ARCHS=$(lipo -archs "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE")
+          case " $ARCHS " in
+            *" arm64 "*) ;;
+            *) echo "Universal app is missing arm64." >&2; exit 1 ;;
+          esac
+          case " $ARCHS " in
+            *" x86_64 "*) ;;
+            *) echo "Universal app is missing x86_64." >&2; exit 1 ;;
+          esac
+
+          mkdir -p release-assets
+          UPDATER_NAME="CC-Switch-${GITHUB_REF_NAME}-macOS-universal.app.tar.gz"
+          ZIP_NAME="CC-Switch-${GITHUB_REF_NAME}-macOS-universal.zip"
+          cp "$TAR_PATH" "release-assets/$UPDATER_NAME"
+          cp "$SIG_PATH" "release-assets/$UPDATER_NAME.sig"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "release-assets/$ZIP_NAME"
+          unzip -t "release-assets/$ZIP_NAME" >/dev/null
+
+      - name: Generate and validate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const directory = "release-assets";
+          const updaterAssets = fs
+            .readdirSync(directory)
+            .filter((name) => name.endsWith(".app.tar.gz"));
+          if (updaterAssets.length !== 1) {
+            throw new Error(`Expected one updater asset, found ${updaterAssets.length}`);
+          }
+
+          const updaterName = updaterAssets[0];
+          const signature = fs
+            .readFileSync(path.join(directory, `${updaterName}.sig`), "utf8")
+            .trim();
+          if (!signature) throw new Error("Updater signature is empty");
+
+          const tag = process.env.GITHUB_REF_NAME;
+          const version = process.env.FORK_VERSION;
+          const repository = process.env.GITHUB_REPOSITORY;
+          const url = `https://github.com/${repository}/releases/download/${tag}/${updaterName}`;
+          const platform = { signature, url };
+          const manifest = {
+            version,
+            notes: `Personal fork release ${tag}`,
+            pub_date: new Date().toISOString(),
+            platforms: {
+              "darwin-aarch64": platform,
+              "darwin-x86_64": platform,
+            },
+          };
+
+          fs.writeFileSync(
+            path.join(directory, "latest.json"),
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
+          NODE
+
+          node <<'NODE'
+          const fs = require("fs");
+          const manifest = JSON.parse(
+            fs.readFileSync("release-assets/latest.json", "utf8"),
+          );
+          if (manifest.version !== process.env.FORK_VERSION) {
+            throw new Error("latest.json version mismatch");
+          }
+          const keys = Object.keys(manifest.platforms).sort();
+          if (keys.join(",") !== "darwin-aarch64,darwin-x86_64") {
+            throw new Error(`Unexpected updater platforms: ${keys.join(",")}`);
+          }
+          for (const key of keys) {
+            const entry = manifest.platforms[key];
+            if (!entry.signature || !entry.url.startsWith("https://github.com/THQDDQHT/cc-switch/releases/download/")) {
+              throw new Error(`Invalid updater entry for ${key}`);
+            }
+          }
+          NODE
+
+      - name: Create or update draft Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 标题需要展开变量；正文含 Markdown 反引号，必须用带引号定界符的 heredoc
+          # 阻止 shell 把反引号当命令替换执行。
+          printf '## CC Switch %s\n\n' "$GITHUB_REF_NAME" > release-notes.md
+          cat >> release-notes.md <<'EOF'
+          这是 `THQDDQHT/cc-switch` 的个人 fork macOS Universal 构建，包含 `arm64` 与 `x86_64`。
+
+          - 自动更新使用本 fork 独立的 Tauri updater 密钥和 GitHub Release endpoint。
+          - 应用使用 ad-hoc code signing，**没有 Apple Developer ID 签名，也没有 Apple notarization**。
+          - 浏览器手动下载后若被 Gatekeeper 阻止，可在确认来源后移除 quarantine 属性。
+          - `.app.tar.gz` 与 `.sig` 仅供应用内 updater 使用；手动安装请下载 `.zip`。
+          EOF
+
+          RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>/dev/null || true)
+          if [ -n "$RELEASE_JSON" ]; then
+            IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | node -e '
+              let input = "";
+              process.stdin.on("data", (chunk) => (input += chunk));
+              process.stdin.on("end", () => process.stdout.write(String(JSON.parse(input).draft)));
+            ')
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "Release already exists and is published; refusing to replace it." >&2
+              exit 1
+            fi
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "CC Switch $GITHUB_REF_NAME" \
+              --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "CC Switch $GITHUB_REF_NAME" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Upload and verify Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          EXPECTED_ASSETS=$(printf '%s\n' release-assets/* | while IFS= read -r path; do basename "$path"; done | sort)
+          ACTUAL_ASSETS=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[].name' | sort)
+          if [ "$EXPECTED_ASSETS" != "$ACTUAL_ASSETS" ]; then
+            echo "Release asset verification failed." >&2
+            diff -u <(printf '%s\n' "$EXPECTED_ASSETS") <(printf '%s\n' "$ACTUAL_ASSETS") || true
+            exit 1
+          fi
+
+          VERIFY_DIR=$(mktemp -d)
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json \
+            --dir "$VERIFY_DIR"
+          cmp release-assets/latest.json "$VERIFY_DIR/latest.json"
+
+      - name: Publish stable latest Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease=false \
+            --latest
+
+          LATEST_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          if [ "$LATEST_TAG" != "$GITHUB_REF_NAME" ]; then
+            echo "Published release is not GitHub latest: $LATEST_TAG" >&2
+            exit 1
+          fi

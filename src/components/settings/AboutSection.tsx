@@ -40,6 +40,7 @@ import type { AppId } from "@/lib/api/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { isWindows } from "@/lib/platform";
 import { isUpdateAvailable } from "@/lib/version";
+import { REPOSITORY_URL, releaseUrlForVersion } from "@/lib/distribution";
 import { ToolUpgradeConfirmDialog } from "./ToolUpgradeConfirmDialog";
 import { ToolInstallRow } from "./ToolInstallRow";
 
@@ -428,23 +429,8 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
   const handleOpenReleaseNotes = useCallback(async () => {
     try {
-      const targetVersion = updateInfo?.availableVersion ?? version ?? "";
-      const displayVersion = targetVersion.startsWith("v")
-        ? targetVersion
-        : targetVersion
-          ? `v${targetVersion}`
-          : "";
-
-      if (!displayVersion) {
-        await settingsApi.openExternal(
-          "https://github.com/farion1231/cc-switch/releases",
-        );
-        return;
-      }
-
-      await settingsApi.openExternal(
-        `https://github.com/farion1231/cc-switch/releases/tag/${displayVersion}`,
-      );
+      const targetVersion = updateInfo?.availableVersion ?? version;
+      await settingsApi.openExternal(releaseUrlForVersion(targetVersion));
     } catch (error) {
       console.error("[AboutSection] Failed to open release notes", error);
       toast.error(t("settings.openReleaseNotesFailed"));
@@ -877,11 +863,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() =>
-                settingsApi.openExternal(
-                  "https://github.com/farion1231/cc-switch",
-                )
-              }
+              onClick={() => settingsApi.openExternal(REPOSITORY_URL)}
               className="h-8 gap-1.5 text-xs"
             >
               <Github className="h-3.5 w-3.5" />

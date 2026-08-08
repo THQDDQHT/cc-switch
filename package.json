@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
+    "dev:fork": "VITE_CC_SWITCH_REPOSITORY_URL=https://github.com/THQDDQHT/cc-switch VITE_CC_SWITCH_RELEASE_TAG_PREFIX=fork-v CC_SWITCH_RELEASES_URL=https://github.com/THQDDQHT/cc-switch/releases/latest pnpm tauri dev --config src-tauri/tauri.fork.conf.json",
     "build": "pnpm tauri build",
+    "build:fork": "VITE_CC_SWITCH_REPOSITORY_URL=https://github.com/THQDDQHT/cc-switch VITE_CC_SWITCH_RELEASE_TAG_PREFIX=fork-v CC_SWITCH_RELEASES_URL=https://github.com/THQDDQHT/cc-switch/releases/latest CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_STRIP=none pnpm tauri build --config src-tauri/tauri.fork.conf.json",
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",

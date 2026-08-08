@@ -18,6 +18,14 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+const DEFAULT_RELEASES_URL: &str = "https://github.com/farion1231/cc-switch/releases/latest";
+
+fn distribution_releases_url() -> &'static str {
+    option_env!("CC_SWITCH_RELEASES_URL")
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(DEFAULT_RELEASES_URL)
+}
+
 /// 打开外部链接
 #[tauri::command]
 pub async fn open_external(app: AppHandle, url: String) -> Result<bool, String> {
@@ -55,10 +63,7 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
 pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
     handle
         .opener()
-        .open_url(
-            "https://github.com/farion1231/cc-switch/releases/latest",
-            None::<String>,
-        )
+        .open_url(distribution_releases_url(), None::<String>)
         .map_err(|e| format!("打开更新页面失败: {e}"))?;
 
     Ok(true)
