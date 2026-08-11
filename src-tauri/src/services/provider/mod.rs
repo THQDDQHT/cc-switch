@@ -1185,6 +1185,7 @@ GEMINI_TIMEOUT_MS=30000
                 "ANTHROPIC_BASE_URL": "https://example.com",
                 "ANTHROPIC_MODEL": "claude-x",
                 "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.4-mini",
+                "CLAUDE_CODE_EFFORT_LEVEL": "max",
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "400000",
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000",
                 // 可共享、非机密配置（复数 _TOKENS 不应被误剥）
@@ -1193,6 +1194,13 @@ GEMINI_TIMEOUT_MS=30000
             },
             "apiKey": "sk-top",
             "api_key": "sk-top2",
+            "model": "provider-model",
+            "alwaysThinkingEnabled": false,
+            "agents": {
+                "reviewer": {
+                    "model": "agent-model"
+                }
+            },
             "theme": "dark",
             "includeCoAuthoredBy": false
         });
@@ -1233,11 +1241,15 @@ GEMINI_TIMEOUT_MS=30000
             .and_then(|e| e.get("CLAUDE_CODE_SUBAGENT_MODEL"))
             .is_none());
         assert!(env
+            .and_then(|e| e.get("CLAUDE_CODE_EFFORT_LEVEL"))
+            .is_none());
+        assert!(env
             .and_then(|e| e.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
             .is_none());
         assert!(env
             .and_then(|e| e.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"))
             .is_none());
+        assert!(value.get("model").is_none());
 
         // 可共享的非机密配置必须保留（含复数 _TOKENS 不被误剥）
         assert_eq!(
@@ -1252,6 +1264,13 @@ GEMINI_TIMEOUT_MS=30000
         );
         assert_eq!(value.get("theme").and_then(|v| v.as_str()), Some("dark"));
         assert_eq!(value.get("includeCoAuthoredBy"), Some(&json!(false)));
+        assert_eq!(value.get("alwaysThinkingEnabled"), Some(&json!(false)));
+        assert_eq!(
+            value
+                .pointer("/agents/reviewer/model")
+                .and_then(Value::as_str),
+            Some("agent-model")
+        );
     }
 
     /// Regression for issue #4272: Fable tier env keys must not enter the shared
@@ -3581,7 +3600,7 @@ impl ProviderService {
     fn extract_claude_common_config(settings: &Value) -> Result<String, AppError> {
         let mut config = settings.clone();
 
-        // 供应商专属的**非机密**字段（模型 + 端点），不应共享。凭据/机密不在此列举，
+        // 供应商专属的**非机密**字段（模型 + effort + 端点），不应共享。凭据/机密不在此列举，
         // 改由 `is_sensitive_config_key`（模式匹配）统一剥离，新供应商的 `*_API_KEY`
         // 等无需再手工补名单即可被覆盖。
         const ENV_PROVIDER_SPECIFIC_EXCLUDES: &[&str] = &[
@@ -3598,6 +3617,7 @@ impl ProviderService {
             "ANTHROPIC_DEFAULT_FABLE_MODEL",
             "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
             "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_EFFORT_LEVEL",
             // Context limits follow the actual upstream model. Sharing these
             // across providers can cap GPT/Kimi to the wrong window and make
             // Claude Code compact too early or miss the upstream limit.
@@ -3608,12 +3628,13 @@ impl ProviderService {
 
         const TOP_LEVEL_EXCLUDES: &[&str] = &[
             "apiBaseUrl",
+            "model",
             // Legacy model fields
             "primaryModel",
             "smallFastModel",
         ];
 
-        // Remove env fields: provider-specific (models/endpoint) + 任何凭据键。
+        // Remove env fields: provider-specific (models/effort/endpoint) + 任何凭据键。
         if let Some(env) = config.get_mut("env").and_then(|v| v.as_object_mut()) {
             let sensitive: Vec<String> = env
                 .keys()
@@ -3632,7 +3653,7 @@ impl ProviderService {
             }
         }
 
-        // Remove top-level fields: legacy model fields + 任何凭据键
+        // Remove top-level fields: current/legacy model fields + 任何凭据键
         // （例如非标准的顶层 apiKey / api_key / *_TOKEN）。
         if let Some(obj) = config.as_object_mut() {
             let sensitive: Vec<String> = obj

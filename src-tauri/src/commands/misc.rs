@@ -1178,22 +1178,8 @@ fn build_exec_line(shell: &str, cwd: Option<&Path>) -> String {
 
 /// 构建 provider 命令行：通过用户 shell 的交互模式执行，确保 GUI 启动的终端也加载用户 PATH。
 #[cfg_attr(windows, allow(dead_code))]
-fn build_provider_command_line(
-    shell: &str,
-    config_path: &str,
-    cwd: Option<&Path>,
-    isolate_settings_sources: bool,
-) -> String {
-    let setting_sources = if isolate_settings_sources {
-        format!(" --setting-sources {}", shell_single_quote(""))
-    } else {
-        String::new()
-    };
-    let claude_command = format!(
-        "claude --settings {}{}",
-        shell_single_quote(config_path),
-        setting_sources
-    );
+fn build_provider_command_line(shell: &str, config_path: &str, cwd: Option<&Path>) -> String {
+    let claude_command = format!("claude --settings {}", shell_single_quote(config_path));
     let command = cwd
         .map(|dir| {
             format!(
@@ -3387,8 +3373,8 @@ pub async fn open_provider_terminal(
         serde_json::json!({ "env": env_map })
     };
 
-    // 根据平台启动终端，传入提供商ID用于生成唯一的配置文件名
-    launch_terminal_with_settings(&settings, &providerId, launch_cwd.as_deref(), is_claude)
+    // 根据平台启动终端；每次调用都会生成独立的配置文件和 launcher。
+    launch_terminal_with_settings(&settings, launch_cwd.as_deref())
         .map_err(|e| format!("启动终端失败: {e}"))?;
 
     Ok(true)
@@ -3472,43 +3458,83 @@ fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
 /// 使用 --settings 参数传入提供商特定的 API 配置
 fn launch_terminal_with_settings(
     settings: &serde_json::Value,
-    provider_id: &str,
     cwd: Option<&Path>,
-    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     let temp_dir = std::env::temp_dir();
     // 写新文件前清理历史残留，避免 temp 目录垃圾累积
     cleanup_stale_terminal_temp_files(&temp_dir);
 
-    let config_file = temp_dir.join(format!(
-        "claude_{}_{}.json",
-        provider_id,
-        std::process::id()
-    ));
+    let launch_id = uuid::Uuid::new_v4().simple().to_string();
+    let launcher_extension = if cfg!(target_os = "windows") {
+        "bat"
+    } else {
+        "sh"
+    };
+    let (config_file, launcher_file) =
+        terminal_launch_temp_paths(&temp_dir, &launch_id, launcher_extension);
 
     // 创建并写入配置文件
     write_claude_config(&config_file, settings)?;
 
     #[cfg(target_os = "macos")]
     {
-        launch_macos_terminal(&config_file, cwd, isolate_settings_sources)?;
-        Ok(())
+        let result = launch_macos_terminal(&config_file, &launcher_file, cwd);
+        if result.is_err() {
+            remove_terminal_launch_files(&config_file, &launcher_file);
+        }
+        result
     }
 
     #[cfg(target_os = "linux")]
     {
-        launch_linux_terminal(&config_file, cwd, isolate_settings_sources)?;
-        Ok(())
+        let result = launch_linux_terminal(&config_file, &launcher_file, cwd);
+        if result.is_err() {
+            remove_terminal_launch_files(&config_file, &launcher_file);
+        }
+        result
     }
 
     #[cfg(target_os = "windows")]
     {
-        launch_windows_terminal(&temp_dir, &config_file, cwd, isolate_settings_sources)?;
-        Ok(())
+        let result = launch_windows_terminal(&config_file, &launcher_file, cwd);
+        if result.is_err() {
+            remove_terminal_launch_files(&config_file, &launcher_file);
+        }
+        result
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    Err("不支持的操作系统".to_string())
+    {
+        remove_terminal_launch_files(&config_file, &launcher_file);
+        Err("不支持的操作系统".to_string())
+    }
+}
+
+fn terminal_launch_temp_paths(
+    temp_dir: &Path,
+    launch_id: &str,
+    launcher_extension: &str,
+) -> (PathBuf, PathBuf) {
+    (
+        temp_dir.join(format!("claude_{launch_id}.json")),
+        temp_dir.join(format!(
+            "cc_switch_launcher_{launch_id}.{launcher_extension}"
+        )),
+    )
+}
+
+fn remove_terminal_launch_files(config_file: &Path, launcher_file: &Path) {
+    for path in [config_file, launcher_file] {
+        if let Err(err) = std::fs::remove_file(path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "Failed to remove terminal launch file {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
 }
 
 /// 写入 claude 配置文件（完整 settings 结构）
@@ -3516,42 +3542,52 @@ fn write_claude_config(
     config_file: &std::path::Path,
     settings: &serde_json::Value,
 ) -> Result<(), String> {
+    use std::io::Write;
+
     let config_json =
         serde_json::to_string_pretty(settings).map_err(|e| format!("序列化配置失败: {e}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
 
-    std::fs::write(config_file, config_json).map_err(|e| format!("写入配置文件失败: {e}"))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(config_file)
+        .map_err(|e| format!("创建配置文件失败: {e}"))?;
+    if let Err(err) = file.write_all(config_json.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(config_file);
+        return Err(format!("写入配置文件失败: {err}"));
+    }
+
+    Ok(())
 }
 
-/// 清理历史临时终端配置文件（claude_*.json 配置 + cc_switch_launcher_*.sh 脚本）。
-/// 策略：删除修改时间超过 24h 的；剩余超过 20 个时删最旧的。
+/// 清理历史临时终端配置文件（claude_*.json 配置 + cc_switch_launcher_* 脚本）。
+/// 只删除修改时间超过 24h 的文件，避免按数量清理时误删仍在运行或尚未执行的 launcher。
 /// 删除失败只 warn，不阻断终端启动（与 cleanup_old_backups 等现有清理模式一致）。
 fn cleanup_stale_terminal_temp_files(temp_dir: &Path) {
     const MAX_AGE_SECS: u64 = 24 * 60 * 60;
-    const MAX_FILES: usize = 20;
 
     let Ok(entries) = std::fs::read_dir(temp_dir) else {
         return;
     };
 
-    let mut candidates: Vec<PathBuf> = entries
+    let now = std::time::SystemTime::now();
+    let candidates = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             (name.starts_with("claude_") && name.ends_with(".json"))
                 || name.starts_with("cc_switch_launcher_")
-        })
-        .collect();
+        });
 
-    if candidates.is_empty() {
-        return;
-    }
-
-    let now = std::time::SystemTime::now();
-    let mut expired = Vec::new();
-    let mut retained = Vec::new();
-
-    for path in candidates.drain(..) {
+    for path in candidates {
         let is_expired = path
             .metadata()
             .and_then(|m| m.modified())
@@ -3559,25 +3595,10 @@ fn cleanup_stale_terminal_temp_files(temp_dir: &Path) {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age.as_secs() > MAX_AGE_SECS);
 
-        if is_expired {
-            expired.push(path);
-        } else {
-            retained.push(path);
+        if !is_expired {
+            continue;
         }
-    }
 
-    // 剩余超过上限时按修改时间排序，删最旧
-    if retained.len() > MAX_FILES {
-        retained.sort_by(|a, b| {
-            let a_time = a.metadata().and_then(|m| m.modified()).ok();
-            let b_time = b.metadata().and_then(|m| m.modified()).ok();
-            a_time.cmp(&b_time)
-        });
-        let excess = retained.len() - MAX_FILES;
-        expired.extend(retained.drain(..excess));
-    }
-
-    for path in expired {
         if let Err(err) = std::fs::remove_file(&path) {
             log::warn!(
                 "Failed to remove stale terminal temp file {}: {}",
@@ -3592,8 +3613,8 @@ fn cleanup_stale_terminal_temp_files(temp_dir: &Path) {
 #[cfg(target_os = "macos")]
 fn launch_macos_terminal(
     config_file: &std::path::Path,
+    script_file: &std::path::Path,
     cwd: Option<&Path>,
-    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3604,11 +3625,8 @@ fn launch_macos_terminal(
     let exec_line = build_exec_line(&shell, cwd);
     let final_cd_command = build_final_shell_cd_command(&shell, cwd);
 
-    let temp_dir = std::env::temp_dir();
-    let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
-    let provider_command =
-        build_provider_command_line(&shell, &config_path, cwd, isolate_settings_sources);
+    let provider_command = build_provider_command_line(&shell, &config_path, cwd);
 
     // Write the shell script to a temp file
     // 脚本使用 POSIX sh 语法确保可移植性，exec 行切换到用户交互式 shell
@@ -3616,11 +3634,14 @@ fn launch_macos_terminal(
     // 避免 trap 在 claude 异步退出时删除时机与读取产生竞态。
     let script_content = format!(
         r#"#!/usr/bin/env sh
-trap 'rm -f "{script_file}"' EXIT
+trap 'rm -f "{config_path}" "{script_file}"' 0
+trap 'exit 129' HUP
+trap 'exit 143' TERM
 echo "Using provider-specific claude config:"
 echo "{config_path}"
 {provider_command}
 rm -f "{config_path}"
+rm -f "{script_file}"
 {final_cd_command}
 {exec_line}
 "#,
@@ -3631,23 +3652,23 @@ rm -f "{config_path}"
         exec_line = exec_line,
     );
 
-    std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
+    std::fs::write(script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
 
     // Make script executable
-    std::fs::set_permissions(&script_file, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(script_file, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("设置脚本权限失败: {e}"))?;
 
     // Try the preferred terminal first, fall back to Terminal.app if it fails
     // Note: Kitty doesn't need the -e flag, others do
     let result = match terminal {
-        "iterm2" => launch_macos_iterm2(&script_file),
-        "warp" => launch_macos_warp(&script_file),
-        "alacritty" => launch_macos_open_app("Alacritty", &script_file, true),
-        "kitty" => launch_macos_open_app("kitty", &script_file, false),
-        "ghostty" => launch_macos_ghostty_provider_tab(&script_file),
-        "wezterm" => launch_macos_wezterm_compatible_tab("WezTerm", "wezterm", &script_file, cwd),
-        "kaku" => launch_macos_wezterm_compatible_tab("Kaku", "kaku", &script_file, cwd),
-        _ => launch_macos_terminal_app(&script_file),
+        "iterm2" => launch_macos_iterm2(script_file),
+        "warp" => launch_macos_warp(script_file),
+        "alacritty" => launch_macos_open_app("Alacritty", script_file, true),
+        "kitty" => launch_macos_open_app("kitty", script_file, false),
+        "ghostty" => launch_macos_ghostty_provider_tab(script_file),
+        "wezterm" => launch_macos_wezterm_compatible_tab("WezTerm", "wezterm", script_file, cwd),
+        "kaku" => launch_macos_wezterm_compatible_tab("Kaku", "kaku", script_file, cwd),
+        _ => launch_macos_terminal_app(script_file),
     };
 
     // If preferred terminal fails and it's not the default, try Terminal.app as fallback
@@ -3657,7 +3678,7 @@ rm -f "{config_path}"
             terminal,
             result.as_ref().err()
         );
-        return launch_macos_terminal_app(&script_file);
+        return launch_macos_terminal_app(script_file);
     }
 
     result
@@ -4032,8 +4053,8 @@ fn launch_macos_warp(script_file: &std::path::Path) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn launch_linux_terminal(
     config_file: &std::path::Path,
+    script_file: &std::path::Path,
     cwd: Option<&Path>,
-    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -4057,19 +4078,19 @@ fn launch_linux_terminal(
     ];
 
     // Create temp script file
-    let temp_dir = std::env::temp_dir();
-    let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
-    let provider_command =
-        build_provider_command_line(&shell, &config_path, cwd, isolate_settings_sources);
+    let provider_command = build_provider_command_line(&shell, &config_path, cwd);
 
     let script_content = format!(
         r#"#!/usr/bin/env sh
-trap 'rm -f "{script_file}"' EXIT
+trap 'rm -f "{config_path}" "{script_file}"' 0
+trap 'exit 129' HUP
+trap 'exit 143' TERM
 echo "Using provider-specific claude config:"
 echo "{config_path}"
 {provider_command}
 rm -f "{config_path}"
+rm -f "{script_file}"
 {final_cd_command}
 {exec_line}
 "#,
@@ -4080,9 +4101,9 @@ rm -f "{config_path}"
         exec_line = exec_line,
     );
 
-    std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
+    std::fs::write(script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
 
-    std::fs::set_permissions(&script_file, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(script_file, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("设置脚本权限失败: {e}"))?;
 
     // Build terminal list: preferred terminal first (if specified), then defaults
@@ -4134,9 +4155,6 @@ rm -f "{config_path}"
         }
     }
 
-    // Clean up on failure
-    let _ = std::fs::remove_file(&script_file);
-    let _ = std::fs::remove_file(config_file);
     Err(last_error)
 }
 
@@ -4154,19 +4172,16 @@ fn which_command(cmd: &str) -> bool {
 /// Windows: 根据用户首选终端启动
 #[cfg(target_os = "windows")]
 fn launch_windows_terminal(
-    temp_dir: &std::path::Path,
     config_file: &std::path::Path,
+    bat_file: &std::path::Path,
     cwd: Option<&Path>,
-    isolate_settings_sources: bool,
 ) -> Result<(), String> {
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
-    let bat_file = temp_dir.join(format!("cc_switch_claude_{}.bat", std::process::id()));
     let config_path_for_batch = escape_windows_batch_value(&config_file.to_string_lossy());
     let cwd_command = build_windows_cwd_command(cwd);
-    let provider_command =
-        build_windows_provider_command_line(&config_path_for_batch, isolate_settings_sources);
+    let provider_command = build_windows_provider_command_line(&config_path_for_batch);
 
     let content = format!(
         "@echo off
@@ -4182,7 +4197,7 @@ del \"%~f0\" >nul 2>&1
         cwd_command = cwd_command,
     );
 
-    std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
+    std::fs::write(bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
     let bat_path = bat_file.to_string_lossy();
     let ps_cmd = format!("& '{}'", bat_path);
@@ -4216,17 +4231,8 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn build_windows_provider_command_line(
-    config_path_for_batch: &str,
-    isolate_settings_sources: bool,
-) -> String {
-    let setting_sources = if isolate_settings_sources {
-        " --setting-sources \"\""
-    } else {
-        ""
-    };
-
-    format!("claude --settings \"{config_path_for_batch}\"{setting_sources}")
+fn build_windows_provider_command_line(config_path_for_batch: &str) -> String {
+    format!("claude --settings \"{config_path_for_batch}\"")
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -4564,7 +4570,7 @@ mod tests {
     #[test]
     fn test_build_provider_command_line_uses_user_shell_environment() {
         assert_eq!(
-            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None, false),
+            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None),
             "'/bin/zsh' -lic 'claude --settings '\"'\"'/tmp/claude config.json'\"'\"''"
         );
         assert_eq!(
@@ -4572,7 +4578,6 @@ mod tests {
                 "/bin/bash",
                 "/tmp/claude config.json",
                 Some(Path::new("/tmp/project")),
-                false,
             ),
             r#"'/bin/bash' -ic 'cd '"'"'/tmp/project'"'"' && claude --settings '"'"'/tmp/claude config.json'"'"''"#
         );
@@ -4581,18 +4586,83 @@ mod tests {
                 "/bin/sh",
                 "/tmp/claude config.json",
                 Some(Path::new("/tmp/project O'Brien")),
-                false,
             ),
             r#"'/bin/sh' -c 'cd '"'"'/tmp/project O'"'"'"'"'"'"'"'"'Brien'"'"' && claude --settings '"'"'/tmp/claude config.json'"'"''"#
         );
     }
 
     #[test]
-    fn test_build_provider_command_line_isolates_claude_settings_sources() {
+    fn test_build_provider_command_line_keeps_default_settings_sources() {
+        let command = build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None);
+
+        assert!(command.contains("claude --settings"));
+        assert!(!command.contains("--setting-sources"));
+    }
+
+    #[test]
+    fn terminal_launch_temp_paths_are_unique_per_launch() {
+        let temp_dir = Path::new("/tmp");
+        let (config_a, script_a) = terminal_launch_temp_paths(temp_dir, "launch-a", "sh");
+        let (config_b, script_b) = terminal_launch_temp_paths(temp_dir, "launch-b", "sh");
+        let (_, windows_script) = terminal_launch_temp_paths(temp_dir, "launch-a", "bat");
+
         assert_eq!(
-            build_provider_command_line("/bin/zsh", "/tmp/claude config.json", None, true,),
-            r#"'/bin/zsh' -lic 'claude --settings '"'"'/tmp/claude config.json'"'"' --setting-sources '"'"''"'"''"#
+            config_a.file_name().and_then(|name| name.to_str()),
+            Some("claude_launch-a.json")
         );
+        assert_eq!(
+            script_a.file_name().and_then(|name| name.to_str()),
+            Some("cc_switch_launcher_launch-a.sh")
+        );
+        assert_eq!(
+            windows_script.file_name().and_then(|name| name.to_str()),
+            Some("cc_switch_launcher_launch-a.bat")
+        );
+        assert_ne!(config_a, config_b);
+        assert_ne!(script_a, script_b);
+    }
+
+    #[test]
+    fn remove_terminal_launch_files_removes_config_and_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("claude_launch.json");
+        let launcher = dir.path().join("cc_switch_launcher_launch.sh");
+        std::fs::write(&config, b"{}").unwrap();
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+
+        remove_terminal_launch_files(&config, &launcher);
+
+        assert!(!config.exists());
+        assert!(!launcher.exists());
+        remove_terminal_launch_files(&config, &launcher);
+    }
+
+    #[test]
+    fn write_claude_config_refuses_to_overwrite_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("claude_launch.json");
+        write_claude_config(&config, &serde_json::json!({"model": "first"})).unwrap();
+
+        let result = write_claude_config(&config, &serde_json::json!({"model": "second"}));
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(config).unwrap(),
+            "{\n  \"model\": \"first\"\n}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_claude_config_uses_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("claude_launch.json");
+        write_claude_config(&config, &serde_json::json!({"model": "private"})).unwrap();
+
+        let mode = std::fs::metadata(config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -6668,17 +6738,17 @@ mod tests {
     #[test]
     fn build_windows_provider_command_line_preserves_existing_behavior() {
         assert_eq!(
-            build_windows_provider_command_line(r"C:\temp dir\claude.json", false),
+            build_windows_provider_command_line(r"C:\temp dir\claude.json"),
             r#"claude --settings "C:\temp dir\claude.json""#
         );
     }
 
     #[test]
-    fn build_windows_provider_command_line_isolates_claude_settings_sources() {
-        assert_eq!(
-            build_windows_provider_command_line(r"C:\temp dir\claude.json", true),
-            r#"claude --settings "C:\temp dir\claude.json" --setting-sources """#
-        );
+    fn build_windows_provider_command_line_keeps_default_settings_sources() {
+        let command = build_windows_provider_command_line(r"C:\temp dir\claude.json");
+
+        assert!(command.contains("claude --settings"));
+        assert!(!command.contains("--setting-sources"));
     }
 
     #[test]
@@ -6728,17 +6798,20 @@ mod tests {
     fn cleanup_stale_terminal_temp_files_removes_expired_only() {
         let dir = tempfile::tempdir().unwrap();
         let fresh = dir.path().join("claude_p1_123.json");
-        let stale = dir.path().join("claude_p2_456.json");
-        let launcher = dir.path().join("cc_switch_launcher_789.sh");
+        let stale = dir.path().join("claude_launch-b.json");
+        let unix_launcher = dir.path().join("cc_switch_launcher_launch-c.sh");
+        let windows_launcher = dir.path().join("cc_switch_launcher_launch-d.bat");
         let unrelated = dir.path().join("other.json");
 
         std::fs::write(&fresh, b"{}").unwrap();
         std::fs::write(&stale, b"{}").unwrap();
-        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&unix_launcher, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&windows_launcher, b"@echo off\r\n").unwrap();
         std::fs::write(&unrelated, b"{}").unwrap();
 
         age_file(&stale, 25); // >24h
-        age_file(&launcher, 25);
+        age_file(&unix_launcher, 25);
+        age_file(&windows_launcher, 25);
         age_file(&unrelated, 25); // 不应被删(非目标前缀)
 
         cleanup_stale_terminal_temp_files(dir.path());
@@ -6746,8 +6819,12 @@ mod tests {
         assert!(fresh.exists(), "fresh config should be kept");
         assert!(!stale.exists(), "stale config (>24h) should be removed");
         assert!(
-            !launcher.exists(),
-            "stale launcher script should be removed"
+            !unix_launcher.exists(),
+            "stale Unix launcher script should be removed"
+        );
+        assert!(
+            !windows_launcher.exists(),
+            "stale Windows launcher script should be removed"
         );
         assert!(
             unrelated.exists(),
@@ -6757,31 +6834,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cleanup_stale_terminal_temp_files_caps_total_count() {
+    fn cleanup_stale_terminal_temp_files_keeps_fresh_launches() {
         let dir = tempfile::tempdir().unwrap();
-        // 21 个新文件(均 <24h),应只保留 20 个,删最旧的 1 个
         let mut paths = Vec::new();
         for i in 0..21 {
-            let p = dir.path().join(format!("claude_p{i}_{i}.json"));
-            std::fs::write(&p, b"{}").unwrap();
-            paths.push(p);
+            let path = dir.path().join(format!("claude_launch-{i}.json"));
+            std::fs::write(&path, b"{}").unwrap();
+            paths.push(path);
         }
 
-        // 让第一个最旧
+        // 即使超过旧的 20 文件上限，未过期文件也可能仍属于运行中或尚未执行的终端。
         age_file(&paths[0], 1);
-
         cleanup_stale_terminal_temp_files(dir.path());
 
-        let remaining = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .count();
-        assert_eq!(remaining, 20, "count should be capped at MAX_FILES");
         assert!(
-            !paths[0].exists(),
-            "oldest file should be removed when over the cap"
+            paths.iter().all(|path| path.exists()),
+            "fresh launch files must never be removed by a count cap"
         );
-        assert!(paths[1].exists(), "newer files should be kept");
     }
 
     #[test]
